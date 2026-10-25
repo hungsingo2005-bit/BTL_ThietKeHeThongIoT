@@ -1,0 +1,326 @@
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <DHT.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <LiquidCrystal_I2C.h>
+
+// ===== 1. CAU HINH WIFI VA HIVEMQ =====
+//const char* WIFI_SSID = "Hào Hùng Phát 2";
+//const char* WIFI_PASS = "999999999";
+const char* WIFI_SSID = "Hùnn";
+const char* WIFI_PASS = "11223301";
+
+const char* MQTT_HOST = "c542be78d0cb4caba47847e0f90e97f5.s1.eu.hivemq.cloud";
+const int MQTT_PORT = 8883;
+const char* MQTT_USER = "lenguyenmanhhung";
+const char* MQTT_PASS = "Manhhung05";
+
+const char* DATA_TOPIC = "iot/sensor/data";
+const char* CMD_TOPIC  = "iot/control/fan";
+
+// ===== 2. KHAI BAO CHAN =====
+#define DHT_PIN 4
+#define DHT_TYPE DHT22
+
+#define RELAY_PIN 23  
+#define LAMP_PIN 19
+#define BUZZER_PIN 18
+
+// Dieu chinh theo module thuc te
+#define RELAY_ACTIVE_LOW true
+#define BUZZER_ACTIVE_HIGH true
+#define LAMP_ACTIVE_HIGH true
+
+// ===== 3. KHOI TAO THIET BI =====
+DHT dht(DHT_PIN, DHT_TYPE);
+Adafruit_MPU6050 mpu;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+WiFiClientSecure secureClient;
+PubSubClient mqtt(secureClient);
+
+// ===== 4. NGUONG CANH BAO =====
+const float TEMP_LIMIT = 35.0;
+const float HUM_LIMIT = 80.0;
+const float VIB_LIMIT = 1.5; // m/s^2, nguong thu nghiem
+
+unsigned long lastRelayToggle = 0;
+bool relayBlinkState = false;
+const unsigned long BEEP_INTERVAL = 200; // 200 ms
+
+bool fanOn = false;
+bool mpuReady = false;
+unsigned long lastPublish = 0;
+unsigned long lastRead = 0;
+
+float temperature = NAN;
+float humidity = NAN;
+float vibration = 0;
+
+bool tempAlert = false;
+bool humAlert = false;
+bool vibAlert = false;
+
+// ===== 5. DIEU KHIEN NGO RA =====
+void setRelay(bool on) {
+  fanOn = on;
+  digitalWrite(RELAY_PIN,
+    RELAY_ACTIVE_LOW ? !on : on);
+}
+
+void setBuzzer(bool on) {
+  digitalWrite(BUZZER_PIN,
+    BUZZER_ACTIVE_HIGH ? on : !on);
+}
+
+void setLamp(bool on) {
+  // Chi dung GPIO neu den co mach dieu khien phu hop.
+  digitalWrite(LAMP_PIN,
+    LAMP_ACTIVE_HIGH ? on : !on);
+}
+
+// ===== 6. WIFI =====
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  Serial.print("Dang ket noi WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi da ket noi!");
+  Serial.println(WiFi.localIP());
+}
+
+// ===== 7. NHAN LENH MQTT =====
+void mqttCallback(char* topic, byte* payload,
+                  unsigned int length) {
+  String message;
+
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  message.trim();
+  message.toUpperCase();
+
+  if (String(topic) == CMD_TOPIC) {
+    if (message == "FAN_ON") {
+      setRelay(true);
+    } else if (message == "FAN_OFF") {
+      setRelay(false);
+    }
+  }
+}
+
+void connectMQTT() {
+  while (!mqtt.connected()) {
+    Serial.print("Dang ket noi HiveMQ...");
+
+    String clientId = "ESP32-Warehouse-" +
+                      String((uint32_t)ESP.getEfuseMac(), HEX);
+
+    if (mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASS)) {
+      Serial.println(" thanh cong!");
+      mqtt.subscribe(CMD_TOPIC);
+    } else {
+      Serial.print(" Loi, state=");
+      Serial.println(mqtt.state());
+      delay(3000);
+    }
+  }
+}
+
+// ===== 8. DOC MPU6050 =====
+void readMPU() {
+  if (!mpuReady) return;
+
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  // Do lon gia toc, sau do tru gia toc trong truong
+  float magnitude = sqrt(
+    a.acceleration.x * a.acceleration.x +
+    a.acceleration.y * a.acceleration.y +
+    a.acceleration.z * a.acceleration.z
+  );
+
+  vibration = fabs(magnitude - 9.81);
+}
+
+// ===== 9. HIEN THI LCD =====
+void updateLCD() {
+  lcd.setCursor(0, 0);
+  lcd.print("T:");
+
+  if (isnan(temperature)) {
+    lcd.print("--.-");
+  } else {
+    lcd.print(temperature, 1);
+  }
+
+  lcd.print("C H:");
+
+  if (isnan(humidity)) {
+    lcd.print("--");
+  } else {
+    lcd.print((int)humidity);
+  }
+
+  lcd.print("%  ");
+
+  lcd.setCursor(0, 1);
+
+  if (vibAlert) {
+    lcd.print("RUNG MANH!      ");
+  } else if (tempAlert || humAlert) {
+    lcd.print("CANH BAO MT     ");
+  } else {
+    lcd.print("Rung:");
+    lcd.print(vibration, 1);
+    lcd.print(" m/s2   ");
+  }
+}
+
+// ===== 10. GUI DU LIEU MQTT =====
+void publishData() {
+  char payload[220];
+
+  snprintf(payload, sizeof(payload),
+    "{\"temperature\":%.2f,\"humidity\":%.2f,"
+    "\"vibration\":%.2f,\"fan\":%s,"
+    "\"tempAlert\":%s,\"humAlert\":%s,"
+    "\"vibAlert\":%s}",
+    temperature, humidity, vibration,
+    fanOn ? "true" : "false",
+    tempAlert ? "true" : "false",
+    humAlert ? "true" : "false",
+    vibAlert ? "true" : "false"
+  );
+
+  if (mqtt.publish(DATA_TOPIC, payload)) {
+    Serial.print("MQTT: ");
+    Serial.println(payload);
+  } else {
+    Serial.println("Gui MQTT that bai");
+  }
+}
+
+// ===== 11. SETUP =====
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LAMP_PIN, OUTPUT);
+
+  setRelay(false);
+  setBuzzer(false);
+  setLamp(false);
+
+  Wire.begin(21, 22);
+
+  dht.begin();
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Kho hang IoT");
+  lcd.setCursor(0, 1);
+  lcd.print("Dang khoi dong");
+
+  if (mpu.begin()) {
+    mpuReady = true;
+    mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    Serial.println("MPU6050 OK");
+  } else {
+    Serial.println("Khong tim thay MPU6050!");
+  }
+
+  connectWiFi();
+
+  // Dung cho thu nghiem. Ban chinh thuc nen xac minh TLS.
+  secureClient.setInsecure();
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(mqttCallback);
+  mqtt.setBufferSize(256);
+
+  lcd.clear();
+}
+
+// ===== 12. LOOP =====
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  if (!mqtt.connected()) {
+    connectMQTT();
+  }
+  mqtt.loop();
+
+  unsigned long now = millis();
+
+  // Doc cam bien moi 500 ms
+  if (now - lastRead >= 500) {
+    lastRead = now;
+
+    temperature = dht.readTemperature();
+    humidity = dht.readHumidity();
+
+    readMPU();
+
+    tempAlert = !isnan(temperature) &&
+                temperature >= TEMP_LIMIT;
+    humAlert = !isnan(humidity) &&
+               humidity >= HUM_LIMIT;
+    vibAlert = mpuReady && vibration >= VIB_LIMIT;
+
+    // Tu dong bat quat khi nhiet do cao
+    // Neu muon dieu khien bang MQTT, bo phan tu dong nay.
+    // Kênh 1: Quạt chỉ phụ thuộc nhiệt độ
+    bool fanAlert = !isnan(temperature) &&
+                    temperature > 35.0;
+
+    setRelay(fanAlert);
+
+    // Kênh 2: Đèn bật nếu nhiệt độ HOẶC độ ẩm vượt ngưỡng
+    bool lampAlert =
+        (!isnan(temperature) && temperature >= 35.0) ||
+        (!isnan(humidity) && humidity >= 80.0);
+
+    setLamp(lampAlert);
+
+    // Kênh 3: Còi bíp bíp liên tục khi rung mạnh
+    if (vibAlert) {
+      if (now - lastRelayToggle >= BEEP_INTERVAL) {
+        lastRelayToggle = now;
+        relayBlinkState = !relayBlinkState;
+        setBuzzer(relayBlinkState);
+      }
+    } else {
+      relayBlinkState = false;
+      setBuzzer(false);
+      lastRelayToggle = now;
+    }
+
+    updateLCD();
+
+    Serial.printf(
+      "T=%.1f C | H=%.1f %% | Rung=%.2f m/s2\n",
+      temperature, humidity, vibration
+    );
+  }
+
+  // Gui du lieu moi 5 giay
+  if (now - lastPublish >= 5000) {
+    lastPublish = now;
+    publishData();
+  }
+}

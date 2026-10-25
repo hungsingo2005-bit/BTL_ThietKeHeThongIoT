@@ -1,0 +1,31 @@
+# Node.js
+node_modules/
+npm-debug.log*
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Build output
+dist/
+build/
+
+# Logs
+logs/
+*.log
+
+# VS Code
+.vscode/
+
+# Other IDE
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Arduino build files
+*.elf
+*.hex
+*.eep
